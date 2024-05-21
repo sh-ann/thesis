@@ -1,0 +1,350 @@
+# !pip install langchain
+# !pip install accelerate
+# !pip install -i https://pypi.org/simple/ bitsandbytes
+import re
+import json
+import os
+import torch
+from transformers import LlamaTokenizer, LlamaForCausalLM, pipeline
+from langchain.llms import HuggingFacePipeline
+from langchain import PromptTemplate, LLMChain
+
+# Load the LLaMA model and tokenizer
+base_model = LlamaForCausalLM.from_pretrained("chavinlo/alpaca-native", device_map='auto')
+tokenizer = LlamaTokenizer.from_pretrained("chavinlo/alpaca-native")
+
+# Define the prompt template
+prompt = PromptTemplate(
+    input_variables=["Query"],
+    template="Write a SQL Query for the given query {Query}.",
+)
+
+# Initialize the HuggingFacePipeline
+pipe = pipeline(
+    "text-generation",
+    model=base_model,
+    tokenizer=tokenizer,
+    max_length=500,
+    temperature=0.3,
+    top_p=0.95,
+    repetition_penalty=1.2,
+)
+local_llm = HuggingFacePipeline(pipeline=pipe)
+llm_chain = LLMChain(prompt=prompt, llm=local_llm)
+
+
+# Define a function to convert the SQL query to a dictionary
+def sql_query_to_dict(query):
+    query = query.replace("{", "{{").replace("}", "}}")
+    query = re.sub(r"(\w+)\s+(\w+)", r'\1 \2', query)
+    query = query.replace("'", '"')
+    # query = json.loads(query)
+    return query
+
+def translate_to_sql(query):
+    # Define the prompt
+    # Here you can also add other parameters if they are known, for example column name and etc.
+    prompt_input = {
+        "Query": query,
+    }
+    sql_query = llm_chain.run(**prompt_input)
+    sql_query = sql_query_to_dict(sql_query)
+
+    return sql_query
+
+import numpy as np
+import pandas as pd
+from sklearn.metrics import accuracy_score
+
+# Load the test dataset
+test_df = pd.read_json('/home/ubuntu/spyderModified_dataset.json')
+predicted_sql = []
+
+for index, row in test_df.iterrows():
+    # Get the natural language query and the gold SQL query
+    query = row['question']
+    gold_sql = row['sql']
+
+    # Use the trained LLM Llama model to generate the predicted SQL query
+    predicted_sql.append(translate_to_sql(query))
+
+predicted_sql = np.array(predicted_sql)
+gold_sql = np.array(test_df['sql'])
+
+# Calculate the accuracy of the model
+accuracy = accuracy_score(gold_sql, predicted_sql)
+print('Accuracy:', accuracy)
+
+query = "Select the name and age of all employees who work in the sales department"
+sql_query = translate_to_sql(query)
+print(sql_query)
+
+# !pip install peft
+# !pip install scikit-learn
+import torch
+torch.cuda.empty_cache()
+from peft import LoftQConfig
+import torch
+from datasets import load_dataset
+from transformers import AutoTokenizer
+from accelerate import Accelerator
+from transformers import AutoModelForSequenceClassification
+from peft import LoraConfig, get_peft_model, TaskType, prepare_model_for_kbit_training
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+from transformers import Trainer, TrainingArguments, DataCollatorForLanguageModeling
+
+device = "cuda:0" if torch.cuda.is_available() else "cpu"
+
+# Load dataset
+dataset = load_dataset("yelp_review_full", split="train[:1%]")
+dataset = dataset.train_test_split(test_size=0.2)
+dataset = dataset.rename_column("label", "labels")
+
+model_name = "LoftQ/Mistral-7B-v0.1-4bit-32rank"
+model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=5, device_map=device)
+
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+tokenizer.pad_token = tokenizer.unk_token
+tokenizer.padding_side = "right"
+
+def tokenize_function(examples):
+    return tokenizer(examples["text"], padding=True, truncation=True, max_length=4096, return_tensors='pt')
+
+tokenized_datasets = dataset.map(tokenize_function, batched=True)
+
+
+training_args = TrainingArguments(
+    output_dir='./results',
+    fp16=True,
+    num_train_epochs=1,
+    per_device_train_batch_size=4,
+    per_device_eval_batch_size=4,
+    warmup_steps=500,
+    weight_decay=0.01,
+    save_total_limit=1,
+    dataloader_pin_memory=False,
+    evaluation_strategy="steps",
+    logging_steps=50,
+    logging_dir='./logs'
+)
+
+data_collator=DataCollatorForLanguageModeling(
+    tokenizer=tokenizer,
+    mlm=False
+)
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=tokenized_datasets["train"],
+    eval_dataset=tokenized_datasets["test"],
+    # compute_metrics=compute_metrics,
+    data_collator=data_collator
+)
+
+trainer.train()
+
+
+# LoftQ quantization
+accelerator = Accelerator()
+loftq_config = LoftQConfig(loftq_bits=4)
+
+model = prepare_model_for_kbit_training(model, loftq_config)
+lora_config = LoraConfig(
+    init_lora_weights="loftq",
+    loftq_config=loftq_config,
+    r=16,
+    lora_alpha=8,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+    lora_dropout=0.05,
+    bias="none",
+    task_type=TaskType.SEQ_CLS
+)
+model = get_peft_model(model, lora_config)
+
+import numpy as np
+import pandas as pd
+from sklearn.metrics import accuracy_score
+
+# Load the test dataset
+test_df = pd.read_json('/home/ubuntu/spyder_dataset.json')
+
+# Initialize the list to store the predicted SQL queries
+predicted_sql = []
+
+# Loop through each row in the test dataset
+for index, row in test_df.iterrows():
+    # Get the natural language query and the gold SQL query
+    query = row['question']
+    gold_sql = row['sql']
+
+    # Use the trained LLM Llama model to generate the predicted SQL query
+    predicted_sql.append(translate_to_sql(query, model))
+
+# Convert the list of predicted SQL queries to a NumPy array
+predicted_sql = np.array(predicted_sql)
+
+# Convert the gold SQL queries to a NumPy array
+gold_sql = np.array(test_df['sql'])
+
+# Calculate the accuracy of the model
+accuracy = accuracy_score(gold_sql, predicted_sql)
+
+# Print the accuracy
+print('Accuracy:', accuracy)
+
+# Let's connect a custom dataset 
+# !pip install pyodbc
+# import pyodbc
+
+# # Create a connection string
+# conn_str = (
+#     r'DRIVER={PostgreSQL ODBC Driver(UNICODE)};'
+#     r'DATABASE=mydatabase;'
+#     r'UID=myusername;'
+#     r'PWD=mypassword;'
+#     r'SERVER=myserver;'
+#     r'PORT=5432;'
+# )
+
+# conn = pyodbc.connect(conn_str)
+# cursor = conn.cursor()
+
+# # Execute a query
+# query = "Select the name and age of all employees who work in the sales department"
+# sql_query = translate_to_sql(query)
+# cursor.execute(query)
+# customers = cursor.fetchall()
+# print(customers)
+
+
+#Let's set a memory limit 
+import torch
+max_memory_gib = torch.cuda.get_device_properties('cuda').total_memory / 2 ** 30
+torch.cuda.set_per_process_memory_fraction(min(1.0, 10 / max_memory_gib))
+print(f"Setting memory limit to {min(1.0, 11 / max_memory_gib) * 100:.2f}%")
+
+import transformers
+model_name = "meta-llama/Llama-2-7b"   # full model: "meta-llama/Llama-2-65b"
+tokenizer = transformers.AutoTokenizer.from_pretrained(model_name)
+model = transformers.AutoModelForCausalLM.from_pretrained(
+    model_name, low_cpu_mem_usage=True, torch_dtype=torch.float16).cuda()
+
+
+# tokenizer converts raw data to pytorch tensors
+batch = tokenizer(["A cat sat", "import numpy"], return_tensors='pt')
+batch = {name: tensor.cuda() for name, tensor in batch.items()}
+print("Batch:", repr(batch)[:70].replace('\n', ' '), ' ...')
+
+
+# We will train here the model for a larger WIKI dataset for not just SQL tasks but for all NL tasks
+from datasets import load_dataset
+
+data = load_dataset("wikitext", "wikitext-2-v1")['train']
+tokenizer.pad_token = tokenizer.eos_token
+
+sample_batch = tokenizer(data['text'][:1], max_length=5, padding=True, pad_to_multiple_of=5, return_tensors='pt')
+
+# example: only train bias parameters, as in the BitFitPaper
+for name, param in model.named_parameters():
+    param.requires_grad = name.endswith("bias")
+    if param.requires_grad:
+        param.data = param.data.to(torch.float32)
+print(f"Total parameters: {sum(p.numel() for p in model.parameters())/1e6:0.2f} million")
+print(f"Trained parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)/1e6:0.2f} million")
+
+
+opt = torch.optim.Adam(model.parameters(), lr=1e-4)
+# model turns those tensors into logits (pre-softmax activations) and loss
+# in the example below, logits are available as pred.logits, and loss is pred.loss
+
+for i in range(10):
+    sample_batch = {name: tensor.cuda() for name, tensor in sample_batch.items()}
+    with torch.cuda.amp.autocast():
+        loss = model(**sample_batch, labels=sample_batch['input_ids']).loss / 1000
+    loss.backward()
+    opt.step()
+    print(f"Loss[{i}] = {loss.item():.3f}")
+
+class _OffloadedLinearOp(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input, saved_weight_path, bias_or_none):
+        weight = torch.load(saved_weight_path, weights_only = True)
+        ctx._saved_weight_path = saved_weight_path
+        ctx._has_bias = bias_or_none is not None
+        result = torch.nn.functional.linear(input, weight.cuda(), bias=None if bias_or_none is None else bias_or_none.cuda())
+        return result
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        weight = torch.load(ctx._saved_weight_path, weights_only = True)
+        grad_input = torch.nn.functional.linear(grad_output, weight.cuda().t())
+        grad_bias = grad_output.flatten(0, -2).sum(0) if ctx._has_bias else None
+        return grad_input, None, grad_bias
+
+class MyOffloadedLinear(torch.nn.Module):
+    def __init__(self, saved_weight_path, bias_or_none):
+        super().__init__()
+        self.saved_weight_path, self.bias_or_none = saved_weight_path, bias_or_none
+        if self.bias_or_none is not None:
+            self.bias_or_none = torch.nn.Parameter(bias_or_none)
+            self.bias_or_none.requires_grad = True
+    def forward(self, input):
+        return _OffloadedLinearOp.apply(input, self.saved_weight_path, self.bias_or_none)
+
+from functools import reduce
+from pathlib import Path
+
+def get_module_by_name(module, access_names):
+    return reduce(getattr, access_names, module)
+
+save_dir = Path(f"model_weights")
+save_dir.mkdir(exist_ok = True)
+named_modulus = list(model.named_modules())
+for name, module in named_modulus:
+    if "proj" in name or "fc" in name or "lm_head" in name:
+        save_path = save_dir / f'{name}.pth'
+        if not save_path.exists(): #not to duplicate during debug
+          torch.save(module.state_dict().get('weight'), save_path)
+        if len(name.split(".")) > 1:
+          linear = get_module_by_name(model, name.split('.')[:-1])
+        else:
+          linear = model
+        offloaded_linear = MyOffloadedLinear(save_path, module.state_dict().get('bias', None))
+        setattr(linear, name.split('.')[-1], offloaded_linear)
+
+for name, param in model.named_parameters():
+    param.requires_grad = "bias" in name
+    if param.requires_grad:
+        param.data = param.data.to(torch.float32)
+
+print(f"Trained parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)/1e6:0.2f} million")
+
+model_name = "meta-llama/Llama-2-7b"
+tokenizer = transformers.AutoTokenizer.from_pretrained(model_name)
+
+small_model = transformers.AutoModelForCausalLM.from_pretrained(
+    model_name, low_cpu_mem_usage=True, torch_dtype=torch.float16, cache_dir="opt-iml/")
+
+save_dir = Path(f"test_model_weights")
+save_dir.mkdir(exist_ok = True)
+named_modulus = list(small_model.named_modules())
+
+for name, module in named_modulus:
+    if "proj" in name or "fc" in name or "lm_head" in name:
+        save_path = save_dir / f'{name}.pth'
+        if not save_path.exists(): #not to duplicate during debug
+          torch.save(module.state_dict().get('weight'), save_path)
+        if len(name.split(".")) > 1:
+          linear = get_module_by_name(small_model, name.split('.')[:-1])
+        else:
+          linear = small_model
+        offloaded_linear = MyOffloadedLinear(save_path, module.state_dict().get('bias', None))
+        setattr(linear, name.split('.')[-1], offloaded_linear)
+
+for name, param in small_model.named_parameters():
+    param.requires_grad = "bias" in name
+    if param.requires_grad:
+        param.data = param.data.to(torch.float32)
+
+

@@ -347,4 +347,30 @@ for name, param in small_model.named_parameters():
     if param.requires_grad:
         param.data = param.data.to(torch.float32)
 
+model_name = "meta-llama/Llama-2-7b"
+tokenizer = transformers.AutoTokenizer.from_pretrained(model_name)
+
+small_model = transformers.AutoModelForCausalLM.from_pretrained(
+    model_name, low_cpu_mem_usage=True, torch_dtype=torch.float16, cache_dir="opt-iml/")
+
+save_dir = Path(f"test_model_weights")
+save_dir.mkdir(exist_ok = True)
+named_modulus = list(small_model.named_modules())
+
+for name, module in named_modulus:
+    if "proj" in name or "fc" in name or "lm_head" in name:
+        save_path = save_dir / f'{name}.pth'
+        if not save_path.exists(): #not to duplicate during debug
+          torch.save(module.state_dict().get('weight'), save_path)
+        if len(name.split(".")) > 1:
+          linear = get_module_by_name(small_model, name.split('.')[:-1])
+        else:
+          linear = small_model
+        offloaded_linear = MyOffloadedLinear(save_path, module.state_dict().get('bias', None))
+        setattr(linear, name.split('.')[-1], offloaded_linear)
+
+for name, param in small_model.named_parameters():
+    param.requires_grad = "bias" in name
+    if param.requires_grad:
+        param.data = param.data.to(torch.float32)
 
